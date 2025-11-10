@@ -2,214 +2,270 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <AccelStepper.h>
 #include <ESP32Servo.h>
 
-// -------------------- Pin Mapping (sudah diperbaiki) --------------------
-#define PIN_LED1   4
-#define PIN_LED2   5
-#define PIN_LED3   6
+// ================== Pin Mapping ==================
+#define LED1_PIN   10
+#define LED2_PIN   11
+#define LED3_PIN   12
 
-#define PIN_BTN1   9   // tombol ke GND (INPUT_PULLUP)
-#define PIN_BTN2   10
+#define BTN1_PIN   13
+#define BTN2_PIN   14
 
-#define PIN_BUZZER 3    // PWM (LEDC)
+#define BUZZER_PIN 3
 
-#define PIN_OLED_SDA 17
-#define PIN_OLED_SCL 18
+// OLED I2C
+#define I2C_SDA    8
+#define I2C_SCL    9
+#define OLED_ADDR  0x3C
+Adafruit_SSD1306 display(128, 64, &Wire);
 
-#define PIN_POT    2    // ADC1_0
+// Potentiometer (ADC)
+#define POT_PIN    1
 
-#define PIN_ENC_A  13
-#define PIN_ENC_B  14
-#define PIN_ENC_SW 12    // tombol encoder (opsional, ke GND)
+// Rotary Encoder (KY-040)
+#define ENC_A_PIN  6
+#define ENC_B_PIN  7
+#define ENC_SW_PIN 5
 
-// PIN STEPPER DIPINDAHKAN DARI 38,39,40 (BERBAHAYA!)
-#define PIN_STP_IN1 47
-#define PIN_STP_IN2 39  // <-- Diubah dari 39
-#define PIN_STP_IN3 40  // <-- Diubah dari 40
-#define PIN_STP_IN4 38  // <-- Diubah dari 38
+// Stepper bipolar 4-kawat (A-, A+, B+, B-)
+#define ST_A_N     21
+#define ST_A_P     39
+#define ST_B_P     40
+#define ST_B_N     38
 
-#define PIN_SERVO  11
-
-// -------------------- Peripherals --------------------
-Adafruit_SSD1306 display(128, 64, &Wire, -1);
-
-// Stepper 28BYJ-48 + ULN2003 (urutan HALF4WIRE: IN1, IN3, IN2, IN4)
-AccelStepper stepper(AccelStepper::HALF4WIRE, PIN_STP_IN1, PIN_STP_IN3, PIN_STP_IN2, PIN_STP_IN4);
-
+// Servo
+#define SERVO_PIN  16
 Servo servo1;
 
-// -------------------- Globals --------------------
-volatile int32_t encCount = 0;
-volatile bool btn1Pressed = false;
-volatile bool btn2Pressed = false;
-volatile bool encSwPressed = false;
+// ================== Variabel Global / RTOS ==================
+volatile long encCount = 0;
+volatile uint8_t lastA = 0, lastB = 0;
+volatile bool encBtnPressed = false;
 
-volatile int potRaw = 0;  // <-- volatile (shared antar core)
-volatile int servoDeg = 0;
-volatile int buzzerFreq = 0;
+TaskHandle_t taskLEDsHandle;
+TaskHandle_t taskBtnBuzzHandle;
+TaskHandle_t taskServoOLEDHandle;
+TaskHandle_t taskStepperHandle;
 
-volatile bool led1 = false, led2 = false, led3 = false; // <-- volatile
+hw_timer_t* beeperTimer = nullptr;
 
-const int LEDC_CH = 0;
-const int LEDC_RES = 10;      // 10-bit
-const int LEDC_BASE_FREQ = 2000;
-
-// -------------------- Encoder ISR --------------------
-// FUNGSI fastRead() DIHAPUS - tidak kompatibel S3 & tidak dipakai
-
-void IRAM_ATTR isrEncA() {
-  static uint8_t last = 0;
-  uint8_t a = digitalRead(PIN_ENC_A);
-  uint8_t b = digitalRead(PIN_ENC_B);
-  uint8_t state = (a << 1) | b;
-  uint8_t combined = (last << 2) | state;
-
-  // Dibalik arah CW/CCW
-  if (combined == 0b0001 || combined == 0b0111 || combined == 0b1110 || combined == 0b1000) encCount--;
-  else if (combined == 0b0010 || combined == 0b0100 || combined == 0b1101 || combined == 0b1011) encCount++;
-  
-  last = state;
+// ================== Utilitas ==================
+void setStepperCoils(uint8_t a_n, uint8_t a_p, uint8_t b_p, uint8_t b_n) {
+  digitalWrite(ST_A_N, a_n);
+  digitalWrite(ST_A_P, a_p);
+  digitalWrite(ST_B_P, b_p);
+  digitalWrite(ST_B_N, b_n);
 }
 
-void IRAM_ATTR isrEncSw() { encSwPressed = true; }
+// 8-step half-stepping untuk bipolar
+const uint8_t STEP_TABLE[8][4] = {
+  {1,0,0,0}, {1,1,0,0}, {0,1,0,0}, {0,1,1,0},
+  {0,0,1,0}, {0,0,1,1}, {0,0,0,1}, {1,0,0,1}
+};
 
-void IRAM_ATTR isrBtn1() { btn1Pressed = true; }
-void IRAM_ATTR isrBtn2() { btn2Pressed = true; }
+// Buzzer menggunakan LEDC tone
+const int BUZZR_CH = 2;
+void beepStart(int freq) {
+  ledcAttachPin(BUZZER_PIN, BUZZR_CH);
+  ledcWriteTone(BUZZR_CH, freq);
+}
+void beepStop() {
+  ledcWrite(BUZZR_CH, 0);
+  ledcDetachPin(BUZZER_PIN);
+}
 
-// -------------------- Tasks --------------------
-void taskIOCore0(void *pv) {
-  // Core 0: baca input (pot/encoder/tombol) + kendali stepper
-  pinMode(PIN_BTN1, INPUT_PULLUP);
-  pinMode(PIN_BTN2, INPUT_PULLUP);
-  pinMode(PIN_ENC_SW, INPUT_PULLUP);
-  pinMode(PIN_ENC_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_B, INPUT_PULLUP);
+// ================== ISR Encoder ==================
+void IRAM_ATTR encISR_A() {
+  uint8_t a = digitalRead(ENC_A_PIN);
+  uint8_t b = digitalRead(ENC_B_PIN);
+  if (a != lastA) {
+    // arah berdasarkan B saat A berubah
+    (a == b) ? encCount++ : encCount--;
+    lastA = a;
+    lastB = b;
+  }
+}
+void IRAM_ATTR encISR_B() {
+  uint8_t a = digitalRead(ENC_A_PIN);
+  uint8_t b = digitalRead(ENC_B_PIN);
+  if (b != lastB) {
+    (a != b) ? encCount++ : encCount--;
+    lastA = a;
+    lastB = b;
+  }
+}
+void IRAM_ATTR encBtnISR() {
+  // tombol ke GND, aktif LOW
+  if (digitalRead(ENC_SW_PIN) == LOW) encBtnPressed = true;
+}
 
-  attachInterrupt(PIN_ENC_A, isrEncA, CHANGE);
-  attachInterrupt(PIN_ENC_SW, isrEncSw, FALLING);
-  attachInterrupt(PIN_BTN1, isrBtn1, FALLING);
-  attachInterrupt(PIN_BTN2, isrBtn2, FALLING);
+// ================== Task: LED pattern (Core 0) ==================
+void taskLEDs(void* pv) {
+  pinMode(LED1_PIN, OUTPUT);
+  pinMode(LED2_PIN, OUTPUT);
+  pinMode(LED3_PIN, OUTPUT);
 
-  // Stepper setup
-  stepper.setMaxSpeed(1200);
-  stepper.setAcceleration(600);
-
-  int32_t lastEnc = encCount;
-  long target = 0;
-
+  uint8_t mode = 0;
   for (;;) {
-    // Baca pot (0..4095)
-    potRaw = analogRead(PIN_POT);
-
-    // Ubah encCount menjadi target stepper (setiap 4 tick = 1 langkah)
-    // Ubah encCount menjadi target stepper (setiap 4 tick = 1 langkah)
-    int32_t now = encCount;
-    if (now != lastEnc) {
-      long delta = (now - lastEnc);
-      // CW: delta positif -> target bertambah, CCW: delta negatif -> target berkurang
-      target += delta * 4;
-      stepper.moveTo(target);
-      lastEnc = now;
-    }
-    stepper.run(); // non-blocking
-
-    // Debounce tombol via flag dari ISR
-    if (btn1Pressed) {
-      btn1Pressed = false;
-      led1 = !led1;
-      digitalWrite(PIN_LED1, led1);
-      vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    if (btn2Pressed) {
-      btn2Pressed = false;
-      led2 = !led2;
-      digitalWrite(PIN_LED2, led2);
-      vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    if (encSwPressed) {
-      encSwPressed = false;
-      led3 = !led3;
-      digitalWrite(PIN_LED3, led3);
-      vTaskDelay(pdMS_TO_TICKS(20));
+    // mode LED diganti oleh BTN2 (diset di task tombol lewat notification)
+    if (ulTaskNotifyTake(pdTRUE, 0)) {
+      mode = (mode + 1) % 3;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2));
+    switch (mode) {
+      case 0: // chaser
+        digitalWrite(LED1_PIN, HIGH); vTaskDelay(pdMS_TO_TICKS(120));
+        digitalWrite(LED1_PIN, LOW);
+        digitalWrite(LED2_PIN, HIGH); vTaskDelay(pdMS_TO_TICKS(120));
+        digitalWrite(LED2_PIN, LOW);
+        digitalWrite(LED3_PIN, HIGH); vTaskDelay(pdMS_TO_TICKS(120));
+        digitalWrite(LED3_PIN, LOW);
+        break;
+      case 1: // blink
+        digitalWrite(LED1_PIN, HIGH);
+        digitalWrite(LED2_PIN, HIGH);
+        digitalWrite(LED3_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        digitalWrite(LED1_PIN, LOW);
+        digitalWrite(LED2_PIN, LOW);
+        digitalWrite(LED3_PIN, LOW);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        break;
+      case 2: // PWM breathing di LED2
+        for (int d=0; d<=255; d+=5) {
+          analogWrite(LED2_PIN, d);
+          vTaskDelay(pdMS_TO_TICKS(8));
+        }
+        for (int d=255; d>=0; d-=5) {
+          analogWrite(LED2_PIN, d);
+          vTaskDelay(pdMS_TO_TICKS(8));
+        }
+        break;
+    }
   }
 }
 
-void taskActuatorsCore1(void *pv) {
-  // Core 1: LED efek, buzzer PWM, servo, OLED
-  pinMode(PIN_LED1, OUTPUT);
-  pinMode(PIN_LED2, OUTPUT);
-  pinMode(PIN_LED3, OUTPUT);
+// ================== Task: Buttons + Buzzer (Core 0) ==================
+void taskButtonsBuzzer(void* pv) {
+  pinMode(BTN1_PIN, INPUT_PULLUP);
+  pinMode(BTN2_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
 
-  // Buzzer PWM
-  // Use Arduino-ESP32 LEDC API
-  ledcSetup(LEDC_CH, LEDC_BASE_FREQ, LEDC_RES);
-  ledcAttachPin(PIN_BUZZER, LEDC_CH);
+  bool buzOn = false;
+  for (;;) {
+    // BTN1: toggle buzzer
+    if (digitalRead(BTN1_PIN) == LOW) {
+      vTaskDelay(pdMS_TO_TICKS(20)); // debounce
+      if (digitalRead(BTN1_PIN) == LOW) {
+        buzOn = !buzOn;
+        if (buzOn) beepStart(1760); else beepStop();
+        while (digitalRead(BTN1_PIN) == LOW) vTaskDelay(pdMS_TO_TICKS(10));
+      }
+    }
 
-  // Servo
-  servo1.attach(PIN_SERVO, 500, 2400);
+    // BTN2: ganti mode LED (notify task LED)
+    if (digitalRead(BTN2_PIN) == LOW) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      if (digitalRead(BTN2_PIN) == LOW) {
+        xTaskNotifyGive(taskLEDsHandle);
+        while (digitalRead(BTN2_PIN) == LOW) vTaskDelay(pdMS_TO_TICKS(10));
+      }
+    }
 
-  // OLED
-  Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ================== Task: Servo + OLED + Pot (Core 1) ==================
+void taskServoOLED(void* pv) {
+  // I2C & OLED
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    
+  }
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  uint32_t t = millis();
+  // Servo
+  servo1.attach(SERVO_PIN);
 
   for (;;) {
-    // Pot → servo & buzzer
-    int raw = potRaw; // Ambil nilai volatile
-    servoDeg = map(raw, 0, 4095, 0, 180);
-    servo1.write(servoDeg);
+    int raw = analogRead(POT_PIN);
+    int angle = map(raw, 0, 4095, 0, 180);
+    servo1.write(angle);
 
-    // frekuensi 200..3000 Hz
-    buzzerFreq = map(raw, 0, 4095, 200, 3000);
-    ledcWriteTone(LEDC_CH, buzzerFreq);
-    // duty (on) ~ 40%
-    ledcWrite(LEDC_CH, (1 << LEDC_RES) * 0.4);
-
-    // LED3 toggle otomatis setiap 500 ms (selain toggle dari tombol encoder)
-    if (millis() - t > 500) {
-      t = millis();
-      digitalWrite(PIN_LED3, !digitalRead(PIN_LED3));
-    }
-
-    // OLED status
+    long enc = encCount;
     display.clearDisplay();
     display.setCursor(0, 0);
-    display.println(F("ESP32-S3 RTOS (2-core)"));
-    display.print(F("POT : ")); display.println(raw);
-    display.print(F("Servo: ")); display.print(servoDeg); display.println(F(" deg"));
-    display.print(F("Buzz : ")); display.print(buzzerFreq); display.println(F(" Hz"));
-    display.print(F("Enc  : ")); display.println((int32_t)encCount);
-    display.print(F("Step : ")); display.println((long)stepper.currentPosition());
-    display.print(F("LEDs : "));
-    display.print(led1); display.print(' ');
-    display.print(led2); display.print(' ');
-    display.println((int)digitalRead(PIN_LED3));
+    display.println(F("ESP32-S3 RTOS Demo"));
+    display.print(F("Pot: ")); display.print(raw);
+    display.print(F("  Ang: ")); display.println(angle);
+    display.print(F("Enc: ")); display.println(enc);
+    display.print(F("Dir Btn: "));
+    display.println(encBtnPressed ? "TOGGLE" : "-");
     display.display();
 
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(200));
   }
 }
 
-// -------------------- Setup/Loop --------------------
-void setup() {
-  // ADC & pins
-  analogReadResolution(12);
+// ================== Task: Stepper (Core 1) ==================
+void taskStepper(void* pv) {
+  pinMode(ST_A_N, OUTPUT);
+  pinMode(ST_A_P, OUTPUT);
+  pinMode(ST_B_P, OUTPUT);
+  pinMode(ST_B_N, OUTPUT);
 
-  // Buat task di dua core
-  xTaskCreatePinnedToCore(taskIOCore0, "IO+Stepper", 8192, nullptr, 2, nullptr, 0);
-  xTaskCreatePinnedToCore(taskActuatorsCore1, "Actuators+UI", 8192, nullptr, 1, nullptr, 1);
+  int stepIndex = 0;
+  bool dirCW = true;
+
+  for (;;) {
+    if (encBtnPressed) {      // tombol encoder untuk ganti arah
+      dirCW = !dirCW;
+      encBtnPressed = false;
+    }
+
+    long speedSteps = abs(encCount);   // semakin diputar semakin cepat
+    speedSteps = constrain(speedSteps, 0, 400);
+    uint16_t delayMs = 4 + (400 - speedSteps) / 2; // 4..204 ms antar microstep
+
+    // keluarkan urutan step
+    const uint8_t* s = STEP_TABLE[stepIndex];
+    setStepperCoils(s[0], s[1], s[2], s[3]);
+
+    stepIndex = (dirCW) ? (stepIndex + 1) : (stepIndex + 7);
+    stepIndex &= 7;
+
+    vTaskDelay(pdMS_TO_TICKS(delayMs));
+  }
+}
+
+// ================== Setup & RTOS start ==================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // Encoder input + interrupt
+  pinMode(ENC_A_PIN, INPUT_PULLUP);
+  pinMode(ENC_B_PIN, INPUT_PULLUP);
+  pinMode(ENC_SW_PIN, INPUT_PULLUP);
+  lastA = digitalRead(ENC_A_PIN);
+  lastB = digitalRead(ENC_B_PIN);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), encISR_A, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), encISR_B, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_SW_PIN), encBtnISR, FALLING);
+
+  // Buat tasks dan pin ke core yang berbeda
+  xTaskCreatePinnedToCore(taskLEDs,        "LEDs",        4096, NULL, 1, &taskLEDsHandle,       0);
+  xTaskCreatePinnedToCore(taskButtonsBuzzer,"ButtonsBuzz", 4096, NULL, 2, &taskBtnBuzzHandle,    0);
+
+  xTaskCreatePinnedToCore(taskServoOLED,   "ServoOLED",   6144, NULL, 1, &taskServoOLEDHandle,   1);
+  xTaskCreatePinnedToCore(taskStepper,     "Stepper",     4096, NULL, 2, &taskStepperHandle,     1);
 }
 
 void loop() {
-  // tidak dipakai (semua via task)
+  // Tidak digunakan karena semua pekerjaan ada di RTOS tasks
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
